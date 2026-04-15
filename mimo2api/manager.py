@@ -298,6 +298,24 @@ class AccountManager:
         self.name = user_info.get("name", self.uid)
         self.logger = logging.getLogger(f"Acc-{self.name}")
 
+    async def get_instance_status(self) -> tuple[str, int]:
+        """获取当前容器的状态和剩余时间(秒)"""
+        url = f"{BASE_URL}/open-apis/user/mimo-claw/status"
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url, cookies=self.cookies, headers=_aistudio_headers(), timeout=15)
+                data = r.json()
+                st = data.get("data", {}).get("status", "")
+                expire_ms = data.get("data", {}).get("expireTime")
+                if expire_ms:
+                    remain_sec = max(0, int(int(expire_ms) / 1000 - time.time()))
+                else:
+                    remain_sec = 0
+                return st, remain_sec
+        except Exception as e:
+            self.logger.error(f"获取状态异常: {e}")
+            return "", 0
+
     async def connect_with_retry(self, client: NativeClawClient, max_retries: int = 10, delay: int = 8, create: bool = True):
         for i in range(max_retries):
             self.logger.info(f"建立长连接 (尝试 {i+1}/{max_retries})...")
@@ -315,10 +333,39 @@ class AccountManager:
             self.logger.info("=== 启动新一轮 Claw 生命周期 (设定运行阈值 55 分钟) ===")
             client = NativeClawClient(self.ph, self.cookies, self.logger)
             try:
-                # 1. 尝试主动销毁（无论是否过期，主动清场重新注入保障最长使用时段）
-                self.logger.info("正在销毁前一代 Claw 实例...")
-                await client.destroy_claw()
-                await asyncio.sleep(3)
+                # 0. 启动时先检查有没有活着的可用实例能够复用
+                st, remain_sec = await self.get_instance_status()
+                self.logger.info(f"探测现有云端实例状态: {st}, 剩余寿命: {remain_sec} 秒")
+                
+                # 若寿命大于 3 分钟且状态为 AVAILABLE，跳过新建
+                if st == "AVAILABLE" and remain_sec > 180:
+                    self.logger.info(f"发现可用宿主环境！尝试直接免重启挂载接入...")
+                    if await self.connect_with_retry(client, max_retries=3, delay=5, create=False):
+                        bridge_code = await get_bridge_code()
+                        inject_prompt = (
+                            "好，请检查当前环境是否有 websockets 和 httpx 依赖（如果没有请马上安装）。\n"
+                            "然后，请先将当前主机上正在运行（如果有的话）的所有资源桥接脚本进程杀掉（例如寻找并 kill 掉包含 ws:// 连结的后台 python 进程），"
+                            "随后，用 nohup 在后台静默运行以下代码（不要阻塞我们的对话）：\n"
+                            "```python\n"
+                            f"{bridge_code}\n"
+                            "```"
+                        )
+                        reply = await client.send_message(inject_prompt, timeout=120)
+                        self.logger.info(f"[复用容器注入网关反馈]: {reply}")
+                        await client.close()
+                        
+                        wait_time = remain_sec - 120
+                        self.logger.info(f"容器直接复用成功！等待休眠 {wait_time} 秒直至其快过期时再触发完整的强制重建...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        self.logger.warning("虽然状态显示 AVAILABLE，但免重建重连失败！继续走全量摧毁新建流程...")
+                
+                # 1. 尝试主动销毁（残血或掉线的，均执行主动清场重来）
+                if st != "DESTROYED":
+                    self.logger.info("准备强制主动销毁残余不再健康的 Claw 实例...")
+                    await client.destroy_claw()
+                    await asyncio.sleep(3)
 
                 # 2. 从头 Create 且连入
                 self.logger.info("申请初始化新云端实例容器...")
