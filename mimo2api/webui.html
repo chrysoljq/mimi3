@@ -370,7 +370,7 @@
                             <td>${u.name || '(未命名)'}</td>
                             <td>
                                 <div><strong style="color: ${u.claw_status === 'AVAILABLE' ? '#10B981' : (u.claw_status === 'EXPIRED(401)' ? '#EF4444' : '#F59E0B')}">${u.claw_status || '未知'}</strong></div>
-                                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+                                <div class="countdown-text" data-remain="${u.remain_sec}" style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
                                     ${u.remain_sec > 0 ? '剩余: ' + Math.floor(u.remain_sec / 60) + ' 分 ' + (u.remain_sec % 60) + ' 秒' : '已过期/无环境'}
                                 </div>
                             </td>
@@ -446,6 +446,20 @@
         fetchStatus();
         fetchUsers();
         statusInterval = setInterval(fetchStatus, 3000); // 实时刷新核心网关节点状态
+        
+        // 本地纯前端倒计时（不消耗任何网络请求）
+        setInterval(() => {
+            document.querySelectorAll('.countdown-text').forEach(el => {
+                let remain = parseInt(el.getAttribute('data-remain'));
+                if (remain > 0) {
+                    remain--;
+                    el.setAttribute('data-remain', remain);
+                    el.textContent = '剩余: ' + Math.floor(remain / 60) + ' 分 ' + (remain % 60) + ' 秒';
+                } else if (remain === 0 && el.textContent.includes('剩余')) {
+                    el.textContent = '即将或已过期...';
+                }
+            });
+        }, 1000);
 
     </script>
 </body>
