@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.Python
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# 运行时与用户数据（勿提交）
+app_state.json
+claw_users.json
+oc_history.json
+users/*.json
+
+# 抓包归档可能含 Cookie/Token，默认不纳入版本库
+archive/http_captures/
+*.sh
+.ai_memory/
