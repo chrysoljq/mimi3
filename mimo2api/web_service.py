@@ -74,7 +74,7 @@ def get_next_client() -> WebSocket | None:
     state.current_client_index = (state.current_client_index + 1) % len(state.active_clients)
     return state.active_clients[state.current_client_index]
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def http_handler(request: Request, path: str):
     if not state.active_clients:
         return Response("Gateway Error: 没有可用的内网节点", status_code=503)
@@ -97,7 +97,7 @@ async def http_handler(request: Request, path: str):
         ws_payload = json.dumps({
             "req_id": req_id,
             "method": method,
-            "path": f"/{path}", # 保留完整路径以备未来内网客户端需要
+            "path": f"/v1/{path}",
             "body": body.decode("utf-8", "ignore")
         })
 
