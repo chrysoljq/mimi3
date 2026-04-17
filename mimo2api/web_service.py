@@ -76,16 +76,23 @@ def get_next_client() -> WebSocket | None:
 
 @app.get("/v1/models")
 async def get_models():
-    models = [
-        "mimo-v2-pro",
-        "mimo-v2-flash",
-        "mimo-v2-omni",
-        "mimo-v2-tts"
-    ]
-    return JSONResponse(content={
-        "object": "list",
-        "data": [{"id": m, "object": "model", "created": 1700000000, "owned_by": "mimo"} for m in models]
-    })
+    models_context = {
+        "mimo-v2-pro": 1000000,
+        "mimo-v2-flash": 256000,
+        "mimo-v2-omni": 256000,
+        "mimo-v2-tts": 8192
+    }
+    data = []
+    for m, ctx in models_context.items():
+        data.append({
+            "id": m,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "mimo",
+            "context_length": ctx,
+            "max_tokens": ctx
+        })
+    return JSONResponse(content={"object": "list", "data": data})
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def http_handler(request: Request, path: str):
