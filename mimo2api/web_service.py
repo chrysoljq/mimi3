@@ -71,8 +71,11 @@ async def ws_tunnel(ws: WebSocket):
 def get_next_client() -> WebSocket | None:
     if not state.active_clients:
         return None
+    if state.current_client_index >= len(state.active_clients):
+        state.current_client_index = 0
+    client = state.active_clients[state.current_client_index]
     state.current_client_index = (state.current_client_index + 1) % len(state.active_clients)
-    return state.active_clients[state.current_client_index]
+    return client
 
 @app.get("/v1/models")
 async def get_models():
@@ -168,7 +171,11 @@ async def http_handler(request: Request, path: str):
                 asyncio.create_task(drain_and_close(req_id, queue))
                 continue
 
-            content_type = first_msg.get("headers", {}).get("content-type", "application/json")
+            response_headers = dict(first_msg.get("headers", {}))
+            content_type = response_headers.pop("content-type", "application/json")
+            response_headers.pop("content-length", None)
+            response_headers.pop("transfer-encoding", None)
+            response_headers.pop("connection", None)
 
             # 构造流式生成器，边收 WS 数据边吐给外部 HTTP
             async def stream_generator(current_req_id, current_queue):
@@ -187,7 +194,12 @@ async def http_handler(request: Request, path: str):
                     state.pending_queues.pop(current_req_id, None)
 
             logger.info(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
-            return StreamingResponse(stream_generator(req_id, queue), status_code=status_code, media_type=content_type)
+            return StreamingResponse(
+                stream_generator(req_id, queue),
+                status_code=status_code,
+                media_type=content_type,
+                headers=response_headers,
+            )
             
         except asyncio.TimeoutError:
             logger.error(f"⚠️ 请求等待内网节点超时 (600s) [{req_id[:8]}]，尝试切换...")
