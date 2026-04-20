@@ -92,6 +92,7 @@ def normalize_response_headers(headers: dict | None) -> tuple[str, dict]:
     content_type = response_headers.pop("content-type", "application/json")
     response_headers.pop("content-length", None)
     response_headers.pop("transfer-encoding", None)
+    response_headers.pop("content-encoding", None)  # bridge已自动解压，移除避免客户端重复解压
     response_headers.pop("connection", None)
     return content_type, response_headers
 
