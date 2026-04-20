@@ -1,7 +1,8 @@
 import asyncio, websockets, httpx, json, os
 
 KEY = os.getenv("MIMO_API_KEY")
-BASE_URL = os.getenv("MIMO_API_ENDPOINT").rstrip("/")
+URL = os.getenv("MIMO_API_ENDPOINT")
+BASE = URL.split("/v1/")[0] if "/v1/" in URL else URL
 WS_URL = "__WS_URL__"
 
 async def handle_request(ws, req):
@@ -10,7 +11,7 @@ async def handle_request(ws, req):
         try:
             async with client.stream(
                 method=req["method"], 
-                url=f"{BASE_URL}{req['path']}", 
+                url=f"{BASE}/anthropic/v1/messages" if "/anthropic/" in req["path"] else URL, 
                 headers={"api-key": KEY, "Content-Type": "application/json"}, 
                 content=req.get("body", "")
             ) as r:
