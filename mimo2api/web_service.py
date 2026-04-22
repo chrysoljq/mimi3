@@ -494,9 +494,14 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
 @app.get("/v1/models")
 async def get_models():
     models_context = {
-        "mimo-v2-pro": 1000000,
+        "mimo-v2.5-pro": 1048576,
+        "mimo-v2.5": 256000,
+        "mimo-v2.5-tts": 8192,
+        "mimo-v2-pro": 1048576,
         "mimo-v2-flash": 256000,
         "mimo-v2-omni": 256000,
+        "mimo-v2.5-tts-voicedesign": 8192,
+        "mimo-v2.5-tts-voiceclone": 8192,
         "mimo-v2-tts": 8192
     }
     data = []
