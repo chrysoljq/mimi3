@@ -17,6 +17,11 @@ import os
 # 引入 Manager 长驻协程任务
 from .manager import start_manager_tasks, trigger_rebuild
 
+# Responses API 转换器
+from .responses_converter import convert_request as responses_convert_request
+from .responses_converter import convert_response as responses_convert_response
+from .responses_converter import ResponsesStreamConverter
+
 # 配置基础日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,6 +53,14 @@ STREAM_KEEPALIVE_INTERVAL = 25  # 秒，需小于 Cloudflare 超时 (~100s)
 QUEUE_DRAIN_TIMEOUT = 5
 DEFAULT_GATEWAY_ERROR = "Gateway Error: 所有节点请求失败"
 NODE_401_COOLDOWN_SECONDS = int(os.getenv("MIMO_NODE_401_COOLDOWN_SECONDS", "900"))
+
+# 后台 fire-and-forget 任务集合，防止 GC 回收和 "exception was never retrieved" 警告
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_task(task: asyncio.Task) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 @dataclass(slots=True)
@@ -92,7 +105,7 @@ async def ws_tunnel(ws: WebSocket):
             # 接收内网传回的结果
             msg = await ws.receive_text()
             data = json.loads(msg)
-            
+
             # 唤醒对应 ID 的 HTTP 请求队列
             req_id = data.get("req_id")
             if req_id and req_id in state.pending_queues:
@@ -110,8 +123,7 @@ async def ws_tunnel(ws: WebSocket):
         state.client_cooldowns.pop(id(ws), None)
         if state.current_client_index >= len(state.active_clients):
             state.current_client_index = 0
-        if ws not in state.active_clients:
-            logger.info(f"当前在线节点数: {len(state.active_clients)}")
+        logger.info(f"当前在线节点数: {len(state.active_clients)}")
 
 
 # 轮询获取下一个可用的客户端
@@ -250,6 +262,7 @@ async def prepare_forward_attempt(
     status_code = first_msg.get("status", 200)
     if status_code == 401:
         cooldown_client(attempt.target_ws, NODE_401_COOLDOWN_SECONDS, "401 Unauthorized")
+        retry_state.status_code = 401
         retry_state.response_text = "Gateway Error: 节点鉴权失败 (401)，已临时跳过该节点"
 
     if should_retry_status(status_code):
@@ -258,7 +271,7 @@ async def prepare_forward_attempt(
             f"(当前 attempt={attempt_number})..."
         )
         retry_state.status_code = status_code
-        asyncio.create_task(drain_and_close(attempt.req_id, attempt.queue))
+        _track_task(asyncio.create_task(drain_and_close(attempt.req_id, attempt.queue)))
         return None
 
     return attempt
@@ -343,29 +356,20 @@ def pick_nested_value(data: Any, path: list[Any]) -> Any:
 
 
 def extract_audio_payload(data: Any) -> tuple[str | None, str | None]:
-    preferred_data_paths = [
-        ["audio", "data"],
-        ["data", "audio", "data"],
-        ["choices", 0, "message", "audio", "data"],
-        ["choices", 0, "audio", "data"],
-        ["output", "audio", "data"],
-    ]
-    preferred_format_paths = [
-        ["audio", "format"],
-        ["data", "audio", "format"],
-        ["choices", 0, "message", "audio", "format"],
-        ["choices", 0, "audio", "format"],
-        ["output", "audio", "format"],
+    # data 和 format 路径成对定义，避免交叉匹配
+    audio_path_pairs = [
+        (["audio", "data"], ["audio", "format"]),
+        (["data", "audio", "data"], ["data", "audio", "format"]),
+        (["choices", 0, "message", "audio", "data"], ["choices", 0, "message", "audio", "format"]),
+        (["choices", 0, "audio", "data"], ["choices", 0, "audio", "format"]),
+        (["output", "audio", "data"], ["output", "audio", "format"]),
     ]
 
-    for path in preferred_data_paths:
-        audio_b64 = pick_nested_value(data, path)
+    for data_path, fmt_path in audio_path_pairs:
+        audio_b64 = pick_nested_value(data, data_path)
         if isinstance(audio_b64, str) and audio_b64:
-            for fmt_path in preferred_format_paths:
-                audio_format = pick_nested_value(data, fmt_path)
-                if isinstance(audio_format, str) and audio_format:
-                    return audio_b64, audio_format
-            return audio_b64, None
+            audio_format = pick_nested_value(data, fmt_path)
+            return audio_b64, audio_format if isinstance(audio_format, str) else None
 
     if isinstance(data, dict):
         audio = data.get("audio")
@@ -492,61 +496,189 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
 
     return Response(retry_state.response_text, status_code=retry_state.status_code)
 
+@app.post("/v1/responses")
+async def responses_handler(request: Request):
+    """将 OpenAI Responses API 请求转换为 Chat Completions 格式后转发。"""
+    if not state.active_clients:
+        return Response("Gateway Error: 没有可用的内网节点", status_code=503)
+
+    body = await request.body()
+    try:
+        req_body = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON"}}, status_code=400)
+
+    # 转换请求格式
+    try:
+        chat_req = responses_convert_request(req_body)
+    except Exception as exc:
+        logger.error(f"⚠️ Responses 请求转换失败: {exc}")
+        return JSONResponse({"error": {"message": f"请求格式转换失败: {exc}"}}, status_code=400)
+
+    model = chat_req.get("model", "")
+    is_streaming = chat_req.get("stream", False) is True
+    # responses API 默认流式
+    if "stream" not in req_body:
+        is_streaming = True
+        chat_req["stream"] = True
+
+    chat_body_text = json.dumps(chat_req, ensure_ascii=False)
+    max_retries = len(state.active_clients)
+    retry_state = RetryState()
+
+    for attempt in range(max_retries):
+        req_id = "unknown"
+        try:
+            prepared = await prepare_forward_attempt(
+                method="POST",
+                path="/v1/chat/completions",
+                body=chat_body_text,
+                log_label="Responses 映射请求",
+                retry_state=retry_state,
+                attempt_number=attempt + 1,
+            )
+            if prepared is None:
+                continue
+            req_id = prepared.req_id
+            queue = prepared.queue
+            first_msg = prepared.first_msg
+            status_code = first_msg.get("status", 200)
+
+            if status_code >= 400:
+                content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
+                raw_body = await collect_response_body(req_id, queue)
+                return Response(raw_body, status_code=status_code, media_type=content_type, headers=response_headers)
+
+            if is_streaming:
+                # 流式: 将 chat/completions SSE chunks 转换为 responses API events
+                converter = ResponsesStreamConverter(model=model)
+
+                async def responses_stream_generator(current_req_id, current_queue):
+                    # Responses 流式同样需要 keepalive 防止 Cloudflare 超时
+                    last_data_time = time.monotonic()
+
+                    async def _do_keepalive():
+                        await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
+                        return b": keep-alive\n\n"
+
+                    data_task = asyncio.ensure_future(current_queue.get())
+                    keepalive_task = asyncio.ensure_future(_do_keepalive())
+
+                    try:
+                        while True:
+                            pending = {data_task}
+                            if keepalive_task is not None:
+                                pending.add(keepalive_task)
+                            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+                            if keepalive_task is not None and keepalive_task in done:
+                                if time.monotonic() - last_data_time > STREAM_CHUNK_TIMEOUT:
+                                    break
+                                yield keepalive_task.result()
+                                keepalive_task = asyncio.ensure_future(_do_keepalive())
+                                # data_task 仍在 pending 中，下一轮继续复用
+                                continue
+
+                            # 真实数据到达，准备下一个 get() task
+                            last_data_time = time.monotonic()
+                            data_task = asyncio.ensure_future(current_queue.get())
+                            msg = done.pop().result()
+                            if msg.get("type") == "finish":
+                                for evt in converter.finalize():
+                                    yield evt.encode("utf-8")
+                                break
+                            elif msg.get("type") == "error":
+                                error_text = msg.get("body", "节点返回错误")
+                                err_evt = f"event: error\ndata: {json.dumps({'type': 'error', 'message': error_text})}\n\n"
+                                yield err_evt.encode("utf-8")
+                                break
+                            elif msg.get("type") == "chunk":
+                                chunk_body = msg.get("body", "")
+                                for line in chunk_body.split("\n"):
+                                    for evt in converter.process_chunk(line):
+                                        yield evt.encode("utf-8")
+                    except (asyncio.TimeoutError, TimeoutError):
+                        logger.error(f"⚠️ Responses 流式传输中断超时 [{current_req_id[:8]}]")
+                        for evt in converter.finalize():
+                            yield evt.encode("utf-8")
+                    finally:
+                        data_task.cancel()
+                        if keepalive_task is not None:
+                            keepalive_task.cancel()
+                        await asyncio.gather(
+                            *[t for t in (data_task, keepalive_task) if t is not None],
+                            return_exceptions=True,
+                        )
+                        cleanup_pending_request(current_req_id)
+
+                logger.info(f"👈 建立 Responses 流式管道 [{req_id[:8]}]")
+                return StreamingResponse(
+                    responses_stream_generator(req_id, queue),
+                    status_code=status_code,
+                    media_type="text/event-stream",
+                    headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+                )
+            else:
+                # 非流式: 收集完整响应后转换
+                raw_body = await collect_response_body(req_id, queue)
+                try:
+                    chat_resp = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    logger.error(f"⚠️ Responses 上游响应不是合法 JSON [{req_id[:8]}]")
+                    return JSONResponse({"error": {"message": "上游返回了非法 JSON"}}, status_code=502)
+
+                responses_resp = responses_convert_response(chat_resp)
+                return JSONResponse(content=responses_resp)
+
+        except asyncio.TimeoutError:
+            logger.error(f"⚠️ Responses 请求等待内网节点超时 (30s) [{req_id[:8]}]，尝试切换...")
+            retry_state.status_code = 504
+            retry_state.response_text = "Gateway Error: 请求内网节点超时 (30s)"
+            cleanup_pending_request(req_id)
+            continue
+
+    return Response(retry_state.response_text, status_code=retry_state.status_code)
+
+# (id, display_name, context_length, max_output)
+_MODELS = [
+    ("mimo-v2.5-pro", "MiMo V2.5 Pro", 1048576, 131072),
+    ("mimo-v2.5", "MiMo V2.5", 1048576, 131072),
+    ("mimo-v2.5-tts", "MiMo V2.5 TTS", 8192, 8192),
+    ("mimo-v2-pro", "MiMo V2 Pro", 1048576, 131072),
+    ("mimo-v2-flash", "MiMo V2 Flash", 256000, 131072),
+    ("mimo-v2-omni", "MiMo V2 Omni", 256000, 131072),
+    ("mimo-v2.5-tts-voicedesign", "MiMo V2.5 TTS VoiceDesign", 8192, 8192),
+    ("mimo-v2.5-tts-voiceclone", "MiMo V2.5 TTS VoiceClone", 8192, 8192),
+    ("mimo-v2-tts", "MiMo V2 TTS", 8192, 8192),
+]
+
+
 @app.get("/v1/models")
 async def get_models():
-    models_context = {
-        "mimo-v2.5-pro": 1048576,
-        "mimo-v2.5": 1048576,
-        "mimo-v2.5-tts": 8192,
-        "mimo-v2-pro": 1048576,
-        "mimo-v2-flash": 256000,
-        "mimo-v2-omni": 256000,
-        "mimo-v2.5-tts-voicedesign": 8192,
-        "mimo-v2.5-tts-voiceclone": 8192,
-        "mimo-v2-tts": 8192
-    }
-    data = []
-    for m, ctx in models_context.items():
-        data.append({
-            "id": m,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "mimo",
-            "context_length": ctx,
-            "max_tokens": ctx
-        })
+    data = [
+        {
+            "id": m[0], "object": "model", "created": 1700000000,
+            "owned_by": "mimo", "context_length": m[2], "max_tokens": m[2],
+        } for m in _MODELS
+    ]
     return JSONResponse(content={"object": "list", "data": data})
+
 
 @app.get("/anthropic/v1/models")
 async def get_anthropic_models():
-    models = [
-        {"id": "mimo-v2.5-pro", "display_name": "MiMo V2.5 Pro", "model_context": 1048576, "max_output": 131072},
-        {"id": "mimo-v2.5", "display_name": "MiMo V2.5", "model_context": 1048576, "max_output": 131072},
-        {"id": "mimo-v2.5-tts", "display_name": "MiMo V2.5 TTS", "model_context": 8192, "max_output": 8192},
-        {"id": "mimo-v2-pro", "display_name": "MiMo V2 Pro", "model_context": 1048576, "max_output": 131072},
-        {"id": "mimo-v2-flash", "display_name": "MiMo V2 Flash", "model_context": 256000, "max_output": 131072},
-        {"id": "mimo-v2-omni", "display_name": "MiMo V2 Omni", "model_context": 256000, "max_output": 131072},
-        {"id": "mimo-v2.5-tts-voicedesign", "display_name": "MiMo V2.5 TTS VoiceDesign", "model_context": 8192, "max_output": 8192},
-        {"id": "mimo-v2.5-tts-voiceclone", "display_name": "MiMo V2.5 TTS VoiceClone", "model_context": 8192, "max_output": 8192},
-        {"id": "mimo-v2-tts", "display_name": "MiMo V2 TTS", "model_context": 8192, "max_output": 8192},
-    ]
     data = [
         {
-            "id": m["id"],
-            "display_name": m["display_name"],
-            "created_at": "2025-01-01T00:00:00Z",
-            "type": "model",
-            "max_input_tokens": m["model_context"],
-            "max_tokens": m["max_output"],
-        } for m in models
+            "id": m[0], "display_name": m[1], "created_at": "2025-01-01T00:00:00Z",
+            "type": "model", "max_input_tokens": m[2], "max_tokens": m[3],
+        } for m in _MODELS
     ]
     return JSONResponse(content={"data": data, "has_more": False, "first_id": data[0]["id"], "last_id": data[-1]["id"]})
 
-@app.api_route("/v1/chat/completions", methods=["GET", "POST", "PUT", "DELETE"])
+@app.post("/v1/chat/completions")
 async def chat_completions_handler(request: Request):
     return await _forward_request(request, "/v1/chat/completions")
 
-@app.api_route("/anthropic/v1/messages", methods=["GET", "POST", "PUT", "DELETE"])
+@app.post("/anthropic/v1/messages")
 async def anthropic_messages_handler(request: Request):
     return await _forward_request(request, "/anthropic/v1/messages")
 
@@ -593,28 +725,37 @@ async def _forward_request(request: Request, path: str):
 
             # 构造流式生成器，边收 WS 数据边吐给外部 HTTP
             async def stream_generator(current_req_id, current_queue, use_keepalive):
-                async def _keepalive():
-                    while True:
-                        await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
-                        yield b": keep-alive\n\n"
+                # keepalive 仅发送心跳注释，超时由 last_data_time 独立判断
+                last_data_time = time.monotonic()
+                keepalive_task = None
+                data_task = asyncio.ensure_future(current_queue.get())
 
-                keepalive_task = asyncio.ensure_future(_keepalive().__anext__()) if use_keepalive else None
+                async def _do_keepalive():
+                    await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
+                    return b": keep-alive\n\n"
+
+                if use_keepalive:
+                    keepalive_task = asyncio.ensure_future(_do_keepalive())
+
                 try:
                     while True:
-                        pending = {asyncio.ensure_future(asyncio.wait_for(
-                            current_queue.get(), timeout=STREAM_CHUNK_TIMEOUT,
-                        ))}
+                        pending = {data_task}
                         if keepalive_task is not None:
                             pending.add(keepalive_task)
                         done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
                         if keepalive_task is not None and keepalive_task in done:
+                            # keepalive 触发；检查真实数据是否已超时
+                            if time.monotonic() - last_data_time > STREAM_CHUNK_TIMEOUT:
+                                break
                             yield keepalive_task.result()
-                            keepalive_task = asyncio.ensure_future(_keepalive().__anext__())
-                            for t in done:
-                                if t is not keepalive_task:
-                                    t.cancel()
-                                    await asyncio.gather(t, return_exceptions=True)
+                            keepalive_task = asyncio.ensure_future(_do_keepalive())
+                            # data_task 仍在 pending 中，下一轮继续复用
                             continue
+
+                        # 真实数据到达，准备下一个 get() task
+                        last_data_time = time.monotonic()
+                        data_task = asyncio.ensure_future(current_queue.get())
                         msg = done.pop().result()
                         if msg.get("type") == "finish":
                             break
@@ -623,9 +764,13 @@ async def _forward_request(request: Request, path: str):
                 except (asyncio.TimeoutError, TimeoutError):
                     logger.error(f"⚠️ 流式传输意外中断超时 [{current_req_id[:8]}]")
                 finally:
+                    data_task.cancel()
                     if keepalive_task is not None:
                         keepalive_task.cancel()
-                        await asyncio.gather(keepalive_task, return_exceptions=True)
+                    await asyncio.gather(
+                        *[t for t in (data_task, keepalive_task) if t is not None],
+                        return_exceptions=True,
+                    )
                     cleanup_pending_request(current_req_id)
 
             logger.info(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
