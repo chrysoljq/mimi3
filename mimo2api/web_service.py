@@ -42,7 +42,7 @@ from .ui_router import router as ui_router
 app.include_router(ui_router)
 
 RETRYABLE_STATUS_CODES = {401, 403, 429}
-NODE_RESPONSE_TIMEOUT = 600
+NODE_RESPONSE_TIMEOUT = 30
 STREAM_CHUNK_TIMEOUT = 120
 QUEUE_DRAIN_TIMEOUT = 5
 DEFAULT_GATEWAY_ERROR = "Gateway Error: 所有节点请求失败"
