@@ -48,7 +48,7 @@ app.include_router(ui_router)
 
 RETRYABLE_STATUS_CODES = {401, 403, 429}
 NODE_RESPONSE_TIMEOUT = 30
-STREAM_CHUNK_TIMEOUT = 120
+STREAM_CHUNK_TIMEOUT = 60
 STREAM_KEEPALIVE_INTERVAL = 25  # 秒，需小于 Cloudflare 超时 (~100s)
 QUEUE_DRAIN_TIMEOUT = 5
 DEFAULT_GATEWAY_ERROR = "Gateway Error: 所有节点请求失败"
@@ -121,6 +121,17 @@ async def ws_tunnel(ws: WebSocket):
         if ws in state.active_clients:
             state.active_clients.remove(ws)
         state.client_cooldowns.pop(id(ws), None)
+        # 清理该节点的所有孤儿队列，防止内存泄漏和请求卡死
+        orphan_ids = state.ws_to_req_ids.pop(id(ws), set())
+        for orphan_id in orphan_ids:
+            q = state.pending_queues.pop(orphan_id, None)
+            if q is not None:
+                try:
+                    q.put_nowait({"type": "error", "body": "节点断开连接"})
+                except asyncio.QueueFull:
+                    pass
+        if orphan_ids:
+            logger.warning(f"🧹 节点断开，已清理 {len(orphan_ids)} 个孤儿请求队列")
         if state.current_client_index >= len(state.active_clients):
             state.current_client_index = 0
         logger.info(f"当前在线节点数: {len(state.active_clients)}")
@@ -155,8 +166,14 @@ def create_pending_request() -> tuple[str, asyncio.Queue]:
     return req_id, queue
 
 
-def cleanup_pending_request(req_id: str) -> None:
+def cleanup_pending_request(req_id: str, ws: WebSocket | None = None) -> None:
     state.pending_queues.pop(req_id, None)
+    if ws is not None:
+        req_ids = state.ws_to_req_ids.get(id(ws))
+        if req_ids is not None:
+            req_ids.discard(req_id)
+            if not req_ids:
+                state.ws_to_req_ids.pop(id(ws), None)
 
 
 def cooldown_client(ws: WebSocket, seconds: int, reason: str) -> None:
@@ -206,6 +223,9 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
         cleanup_pending_request(req_id)
         return None
 
+    # 追踪 req_id 归属到哪个 WS 节点，用于断连时清理孤儿队列
+    state.ws_to_req_ids.setdefault(id(target_ws), set()).add(req_id)
+
     ws_payload = build_ws_payload(req_id, method, path, body)
 
     try:
@@ -216,10 +236,11 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
         )
     except RuntimeError:
         logger.warning(f"⚠️ {log_label} 转发失败，节点状态异常，尝试切换...")
+        cleanup_pending_request(req_id, target_ws)
         if target_ws in state.active_clients:
             state.active_clients.remove(target_ws)
         state.client_cooldowns.pop(id(target_ws), None)
-        cleanup_pending_request(req_id)
+        state.ws_to_req_ids.pop(id(target_ws), None)
         return None
 
     first_msg = await asyncio.wait_for(queue.get(), timeout=NODE_RESPONSE_TIMEOUT)
@@ -554,7 +575,6 @@ async def responses_handler(request: Request):
                 converter = ResponsesStreamConverter(model=model)
 
                 async def responses_stream_generator(current_req_id, current_queue):
-                    # Responses 流式同样需要 keepalive 防止 Cloudflare 超时
                     last_data_time = time.monotonic()
 
                     async def _do_keepalive():
@@ -566,20 +586,23 @@ async def responses_handler(request: Request):
 
                     try:
                         while True:
-                            pending = {data_task}
-                            if keepalive_task is not None:
-                                pending.add(keepalive_task)
-                            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                            done, _ = await asyncio.wait(
+                                {data_task, keepalive_task}, return_when=asyncio.FIRST_COMPLETED
+                            )
 
-                            if keepalive_task is not None and keepalive_task in done:
-                                if time.monotonic() - last_data_time > STREAM_CHUNK_TIMEOUT:
+                            if keepalive_task in done:
+                                elapsed = time.monotonic() - last_data_time
+                                if elapsed > STREAM_CHUNK_TIMEOUT:
+                                    logger.warning(
+                                        f"⚠️ Responses 流式 {elapsed:.0f}s 无数据，节点可能已断开 "
+                                        f"[{current_req_id[:8]}]"
+                                    )
                                     break
                                 yield keepalive_task.result()
                                 keepalive_task = asyncio.ensure_future(_do_keepalive())
-                                # data_task 仍在 pending 中，下一轮继续复用
                                 continue
 
-                            # 真实数据到达，准备下一个 get() task
+                            # 数据到达
                             last_data_time = time.monotonic()
                             data_task = asyncio.ensure_future(current_queue.get())
                             msg = done.pop().result()
@@ -603,12 +626,8 @@ async def responses_handler(request: Request):
                             yield evt.encode("utf-8")
                     finally:
                         data_task.cancel()
-                        if keepalive_task is not None:
-                            keepalive_task.cancel()
-                        await asyncio.gather(
-                            *[t for t in (data_task, keepalive_task) if t is not None],
-                            return_exceptions=True,
-                        )
+                        keepalive_task.cancel()
+                        await asyncio.gather(data_task, keepalive_task, return_exceptions=True)
                         cleanup_pending_request(current_req_id)
 
                 logger.info(f"👈 建立 Responses 流式管道 [{req_id[:8]}]")
@@ -725,10 +744,9 @@ async def _forward_request(request: Request, path: str):
 
             # 构造流式生成器，边收 WS 数据边吐给外部 HTTP
             async def stream_generator(current_req_id, current_queue, use_keepalive):
-                # keepalive 仅发送心跳注释，超时由 last_data_time 独立判断
                 last_data_time = time.monotonic()
-                keepalive_task = None
                 data_task = asyncio.ensure_future(current_queue.get())
+                keepalive_task = None
 
                 async def _do_keepalive():
                     await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
@@ -745,15 +763,18 @@ async def _forward_request(request: Request, path: str):
                         done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
                         if keepalive_task is not None and keepalive_task in done:
-                            # keepalive 触发；检查真实数据是否已超时
-                            if time.monotonic() - last_data_time > STREAM_CHUNK_TIMEOUT:
+                            elapsed = time.monotonic() - last_data_time
+                            if elapsed > STREAM_CHUNK_TIMEOUT:
+                                logger.warning(
+                                    f"⚠️ 流式 {elapsed:.0f}s 无数据，节点可能已断开 "
+                                    f"[{current_req_id[:8]}]"
+                                )
                                 break
                             yield keepalive_task.result()
                             keepalive_task = asyncio.ensure_future(_do_keepalive())
-                            # data_task 仍在 pending 中，下一轮继续复用
                             continue
 
-                        # 真实数据到达，准备下一个 get() task
+                        # 数据到达
                         last_data_time = time.monotonic()
                         data_task = asyncio.ensure_future(current_queue.get())
                         msg = done.pop().result()
