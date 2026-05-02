@@ -1,8 +1,11 @@
 import asyncio
+import json
 import time
 from collections import deque
 from typing import Any, Dict, List
 from fastapi import WebSocket
+
+METRICS_SNAPSHOT_PATH = None  # 延迟初始化，在 metrics_store 中设置
 
 class GatewayState:
     def __init__(self):
@@ -14,7 +17,11 @@ class GatewayState:
         self.client_cooldowns: Dict[int, float] = {}
         self.metrics_started_at: float = time.time()
         self.metrics_history_last_snapshot: Dict[str, Any] | None = None
-        self.metrics: Dict[str, Any] = {
+        self.metrics: Dict[str, Any] = self._default_metrics()
+
+    @staticmethod
+    def _default_metrics() -> Dict[str, Any]:
+        return {
             "requests_total": 0,
             "requests_succeeded": 0,
             "requests_failed": 0,

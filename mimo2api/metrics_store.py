@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+from collections import deque
 from typing import Any
 
 from fastapi import WebSocket
@@ -13,6 +14,8 @@ METRICS_BUCKET_SECONDS = max(60, int(os.getenv("MIMO_METRICS_BUCKET_SECONDS", "3
 METRICS_RETENTION_DAYS = max(1, int(os.getenv("MIMO_METRICS_RETENTION_DAYS", "90")))
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 METRICS_DB_PATH = os.getenv("MIMO_METRICS_DB_PATH", os.path.join(ROOT_DIR, "gateway_metrics.db"))
+METRICS_SNAPSHOT_PATH = os.getenv("MIMO_METRICS_SNAPSHOT_PATH", os.path.join(ROOT_DIR, "gateway_snapshot.json"))
+METRICS_SNAPSHOT_INTERVAL = 60  # 每 60 秒保存一次
 
 
 def node_label(ws: WebSocket) -> str:
@@ -390,16 +393,26 @@ async def flush_history_bucket(bucket_start: int) -> None:
 
 
 async def metrics_history_worker() -> None:
+    # 启动时加载历史累积指标
+    if load_cumulative_metrics():
+        import logging
+        logging.getLogger(__name__).info("📊 已从快照恢复累积指标")
     state.metrics_history_last_snapshot = capture_metrics_snapshot()
+    last_save = time.time()
     try:
         while True:
             now = time.time()
             next_bucket_start = (int(now) // METRICS_BUCKET_SECONDS + 1) * METRICS_BUCKET_SECONDS
             await asyncio.sleep(max(1, next_bucket_start - now))
             await flush_history_bucket(next_bucket_start - METRICS_BUCKET_SECONDS)
+            # 定期保存累积指标
+            if time.time() - last_save >= METRICS_SNAPSHOT_INTERVAL:
+                await asyncio.to_thread(save_cumulative_metrics)
+                last_save = time.time()
     except asyncio.CancelledError:
         current_bucket_start = (int(time.time()) // METRICS_BUCKET_SECONDS) * METRICS_BUCKET_SECONDS
         await flush_history_bucket(current_bucket_start)
+        await asyncio.to_thread(save_cumulative_metrics)
         raise
 
 
@@ -604,3 +617,106 @@ def build_gateway_stats(background_tasks_count: int) -> dict[str, Any]:
         "routes": routes,
         "nodes": nodes,
     }
+
+
+# ─── 累积指标持久化 ───
+
+def save_cumulative_metrics() -> None:
+    """将当前累积指标保存到 JSON 文件"""
+    m = state.metrics
+    data = {
+        "saved_at": time.time(),
+        "requests_total": int(m["requests_total"]),
+        "requests_succeeded": int(m["requests_succeeded"]),
+        "requests_failed": int(m["requests_failed"]),
+        "streaming_requests": int(m["streaming_requests"]),
+        "non_streaming_requests": int(m["non_streaming_requests"]),
+        "attempts_total": int(m["attempts_total"]),
+        "attempts_succeeded": int(m["attempts_succeeded"]),
+        "attempts_failed": int(m["attempts_failed"]),
+        "request_latency_sum_ms": float(m["request_latency_sum_ms"]),
+        "request_first_byte_latency_sum_ms": float(m["request_first_byte_latency_sum_ms"]),
+        "status_codes": dict(m["status_codes"]),
+        "tokens": {
+            "requests_with_usage": int(m["tokens"]["requests_with_usage"]),
+            "prompt_tokens": int(m["tokens"]["prompt_tokens"]),
+            "completion_tokens": int(m["tokens"]["completion_tokens"]),
+            "total_tokens": int(m["tokens"]["total_tokens"]),
+        },
+        "routes": {},
+        "nodes": {},
+    }
+    for rk, rv in m["routes"].items():
+        data["routes"][rk] = {
+            "requests_total": int(rv["requests_total"]),
+            "requests_succeeded": int(rv["requests_succeeded"]),
+            "requests_failed": int(rv["requests_failed"]),
+            "streaming_requests": int(rv["streaming_requests"]),
+            "non_streaming_requests": int(rv["non_streaming_requests"]),
+            "request_latency_sum_ms": float(rv["request_latency_sum_ms"]),
+            "request_first_byte_latency_sum_ms": float(rv["request_first_byte_latency_sum_ms"]),
+            "status_codes": dict(rv["status_codes"]),
+            "tokens": {k: int(v) for k, v in rv["tokens"].items()},
+        }
+    for nk, nv in m["nodes"].items():
+        data["nodes"][nk] = {
+            "attempts_total": int(nv["attempts_total"]),
+            "attempts_succeeded": int(nv["attempts_succeeded"]),
+            "attempts_failed": int(nv["attempts_failed"]),
+            "latency_sum_ms": float(nv["latency_sum_ms"]),
+            "first_byte_latency_sum_ms": float(nv["first_byte_latency_sum_ms"]),
+            "status_codes": dict(nv["status_codes"]),
+        }
+    tmp = METRICS_SNAPSHOT_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, METRICS_SNAPSHOT_PATH)
+    except Exception:
+        pass
+
+
+def load_cumulative_metrics() -> bool:
+    """从 JSON 文件恢复累积指标，返回是否成功加载"""
+    if not os.path.exists(METRICS_SNAPSHOT_PATH):
+        return False
+    try:
+        with open(METRICS_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    m = state.metrics
+    m["requests_total"] = data.get("requests_total", 0)
+    m["requests_succeeded"] = data.get("requests_succeeded", 0)
+    m["requests_failed"] = data.get("requests_failed", 0)
+    m["streaming_requests"] = data.get("streaming_requests", 0)
+    m["non_streaming_requests"] = data.get("non_streaming_requests", 0)
+    m["attempts_total"] = data.get("attempts_total", 0)
+    m["attempts_succeeded"] = data.get("attempts_succeeded", 0)
+    m["attempts_failed"] = data.get("attempts_failed", 0)
+    m["request_latency_sum_ms"] = data.get("request_latency_sum_ms", 0.0)
+    m["request_first_byte_latency_sum_ms"] = data.get("request_first_byte_latency_sum_ms", 0.0)
+    m["status_codes"] = data.get("status_codes", {})
+    m["tokens"] = data.get("tokens", m["tokens"])
+
+    for rk, rv in data.get("routes", {}).items():
+        route = _ensure_route_metrics(rk)
+        for key, val in rv.items():
+            if key == "tokens":
+                for tk, tv in val.items():
+                    route["tokens"][tk] = tv
+            elif key == "status_codes":
+                route["status_codes"] = val
+            else:
+                route[key] = val
+
+    for nk, nv in data.get("nodes", {}).items():
+        node = _ensure_node_metrics(nk)
+        for key, val in nv.items():
+            if key == "status_codes":
+                node["status_codes"] = val
+            else:
+                node[key] = val
+
+    return True
