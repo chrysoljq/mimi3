@@ -19,4 +19,4 @@ users/*.json
 archive/http_captures/
 *.sh
 .ai_memory/
-.vscode
+.vscodestatus_page/
