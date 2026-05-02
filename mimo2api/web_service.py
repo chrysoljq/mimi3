@@ -1,16 +1,16 @@
 import asyncio
 import base64
 import binascii
+import fcntl
 import json
-import uuid
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
 import uvicorn
 import os
 
@@ -21,21 +21,54 @@ from .manager import start_manager_tasks, trigger_rebuild
 from .responses_converter import convert_request as responses_convert_request
 from .responses_converter import convert_response as responses_convert_response
 from .responses_converter import ResponsesStreamConverter
+from .audio_helpers import (
+    AudioSpeechRequest,
+    audio_media_type,
+    extract_audio_payload,
+    map_openai_tts_model,
+    map_openai_tts_voice,
+)
+from .metrics_store import (
+    METRICS_BUCKET_SECONDS,
+    METRICS_RETENTION_DAYS,
+    build_gateway_stats,
+    extract_usage_from_sse_chunk,
+    init_metrics_db,
+    load_status_history,
+    metrics_history_worker,
+    node_label,
+    record_attempt_finished,
+    record_attempt_started,
+    record_request_finished,
+    record_request_started,
+)
 
 # 配置基础日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 manager_bg_task = None
+metrics_persist_task = None
+single_process_lock_file = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global manager_bg_task
+    global manager_bg_task, metrics_persist_task
     logger.info("🚀 正在拉起挂后台的 Claw 账号守护线程...")
+    acquire_single_process_lock()
+    await asyncio.to_thread(init_metrics_db)
     manager_bg_task = asyncio.create_task(start_manager_tasks())
+    metrics_persist_task = asyncio.create_task(metrics_history_worker())
     yield
     if manager_bg_task:
         manager_bg_task.cancel()
+    if metrics_persist_task:
+        metrics_persist_task.cancel()
+        try:
+            await metrics_persist_task
+        except asyncio.CancelledError:
+            pass
+    release_single_process_lock()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -53,6 +86,8 @@ STREAM_KEEPALIVE_INTERVAL = 25  # 秒，需小于 Cloudflare 超时 (~100s)
 QUEUE_DRAIN_TIMEOUT = 5
 DEFAULT_GATEWAY_ERROR = "Gateway Error: 所有节点请求失败"
 NODE_401_COOLDOWN_SECONDS = int(os.getenv("MIMO_NODE_401_COOLDOWN_SECONDS", "900"))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESS_LOCK_PATH = os.getenv("MIMO_PROCESS_LOCK_PATH", os.path.join(ROOT_DIR, "mimo2api.lock"))
 
 # 后台 fire-and-forget 任务集合，防止 GC 回收和 "exception was never retrieved" 警告
 _background_tasks: set[asyncio.Task] = set()
@@ -61,6 +96,39 @@ _background_tasks: set[asyncio.Task] = set()
 def _track_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+def acquire_single_process_lock() -> None:
+    global single_process_lock_file
+    if single_process_lock_file is not None:
+        return
+
+    lock_file = open(PROCESS_LOCK_PATH, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_file.close()
+        raise RuntimeError(
+            "mimo2api 当前仅支持单进程运行，检测到另一个网关进程已持有锁。"
+            "请使用单 worker 部署，或引入外部队列后再做多进程扩展。"
+        ) from exc
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    single_process_lock_file = lock_file
+
+
+def release_single_process_lock() -> None:
+    global single_process_lock_file
+    if single_process_lock_file is None:
+        return
+    try:
+        fcntl.flock(single_process_lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        single_process_lock_file.close()
+        single_process_lock_file = None
 
 
 @dataclass(slots=True)
@@ -77,20 +145,23 @@ class ForwardAttempt:
     first_msg: dict[str, Any]
     attempt_number: int
 
-
-class AudioSpeechRequest(BaseModel):
-    input: str = Field(min_length=1)
-    model: str | None = None
-    voice: str | None = None
-    response_format: str = "wav"
-    instructions: str | None = None
-
 @app.post("/api/rebuild")
 async def api_rebuild():
     """手动触发所有 Claw 节点强制销毁重建（用于更新 bridge.py 等场景）"""
     trigger_rebuild()
     logger.info("🔔 手动重建信号已发送")
     return JSONResponse(content={"ok": True, "message": "重建信号已发送，所有节点将在当前循环结束后立即重建"})
+
+
+@app.get("/api/stats")
+async def api_stats():
+    return JSONResponse(content=build_gateway_stats(len(_background_tasks)))
+
+
+@app.get("/api/status/history")
+async def api_status_history(hours: int = 24):
+    hours = max(1, min(hours, 24 * METRICS_RETENTION_DAYS))
+    return JSONResponse(content=await asyncio.to_thread(load_status_history, hours))
 
 @app.websocket("/ws")
 async def ws_tunnel(ws: WebSocket):
@@ -203,10 +274,6 @@ def should_retry_status(status_code: int) -> bool:
     return status_code in RETRYABLE_STATUS_CODES or status_code >= 500
 
 
-def node_label(ws: WebSocket) -> str:
-    return ws.client.host if ws.client else "Unknown"
-
-
 def build_ws_payload(req_id: str, method: str, path: str, body: str) -> str:
     return json.dumps({
         "req_id": req_id,
@@ -227,6 +294,8 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
     state.ws_to_req_ids.setdefault(id(target_ws), set()).add(req_id)
 
     ws_payload = build_ws_payload(req_id, method, path, body)
+    attempt_started_at = time.monotonic()
+    record_attempt_started(target_ws)
 
     try:
         await target_ws.send_text(ws_payload)
@@ -235,6 +304,12 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
             f"(尝试 {attempt_number})"
         )
     except RuntimeError:
+        record_attempt_finished(
+            target_ws=target_ws,
+            status_code=0,
+            first_byte_latency_ms=(time.monotonic() - attempt_started_at) * 1000,
+            success=False,
+        )
         logger.warning(f"⚠️ {log_label} 转发失败，节点状态异常，尝试切换...")
         cleanup_pending_request(req_id, target_ws)
         if target_ws in state.active_clients:
@@ -243,7 +318,23 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
         state.ws_to_req_ids.pop(id(target_ws), None)
         return None
 
-    first_msg = await asyncio.wait_for(queue.get(), timeout=NODE_RESPONSE_TIMEOUT)
+    try:
+        first_msg = await asyncio.wait_for(queue.get(), timeout=NODE_RESPONSE_TIMEOUT)
+    except asyncio.TimeoutError:
+        record_attempt_finished(
+            target_ws=target_ws,
+            status_code=504,
+            first_byte_latency_ms=(time.monotonic() - attempt_started_at) * 1000,
+            success=False,
+        )
+        raise
+
+    record_attempt_finished(
+        target_ws=target_ws,
+        status_code=int(first_msg.get("status", 200)),
+        first_byte_latency_ms=(time.monotonic() - attempt_started_at) * 1000,
+        success=first_msg.get("type") != "error" and not should_retry_status(int(first_msg.get("status", 200))),
+    )
     return ForwardAttempt(
         req_id=req_id,
         queue=queue,
@@ -308,110 +399,6 @@ def normalize_response_headers(headers: dict | None) -> tuple[str, dict]:
     return content_type, response_headers
 
 
-def map_openai_tts_voice(voice: str | None) -> str:
-    default_voice_map = {
-        "alloy": "mimo_default",
-        "ash": "mimo_default",
-        "ballad": "mimo_default",
-        "coral": "mimo_default",
-        "echo": "mimo_default",
-        "fable": "mimo_default",
-        "nova": "mimo_default",
-        "onyx": "mimo_default",
-        "sage": "mimo_default",
-        "shimmer": "mimo_default",
-        "verse": "mimo_default",
-    }
-    override_map_raw = os.getenv("MIMO_TTS_VOICE_MAP", "").strip()
-    if override_map_raw:
-        try:
-            override_map = json.loads(override_map_raw)
-            if isinstance(override_map, dict):
-                default_voice_map.update({str(k): str(v) for k, v in override_map.items()})
-        except json.JSONDecodeError:
-            logger.warning("⚠️ MIMO_TTS_VOICE_MAP 不是合法 JSON，忽略自定义语音映射")
-
-    if not voice:
-        return "mimo_default"
-    return default_voice_map.get(voice, voice)
-
-
-def map_openai_tts_model(model: str | None) -> str:
-    if not model:
-        return "mimo-v2-tts"
-    model_map = {
-        "tts-1": "mimo-v2-tts",
-        "tts-1-hd": "mimo-v2-tts",
-        "gpt-4o-mini-tts": "mimo-v2-tts",
-        "mimo-v2-tts": "mimo-v2-tts",
-    }
-    return model_map.get(model, "mimo-v2-tts")
-
-
-def audio_media_type(audio_format: str) -> str:
-    media_types = {
-        "aac": "audio/aac",
-        "flac": "audio/flac",
-        "mp3": "audio/mpeg",
-        "opus": "audio/ogg",
-        "pcm": "audio/pcm",
-        "wav": "audio/wav",
-    }
-    return media_types.get(audio_format.lower(), "application/octet-stream")
-
-
-def pick_nested_value(data: Any, path: list[Any]) -> Any:
-    current = data
-    for key in path:
-        if isinstance(key, int):
-            if not isinstance(current, list) or key >= len(current):
-                return None
-            current = current[key]
-        else:
-            if not isinstance(current, dict):
-                return None
-            current = current.get(key)
-            if current is None:
-                return None
-    return current
-
-
-def extract_audio_payload(data: Any) -> tuple[str | None, str | None]:
-    # data 和 format 路径成对定义，避免交叉匹配
-    audio_path_pairs = [
-        (["audio", "data"], ["audio", "format"]),
-        (["data", "audio", "data"], ["data", "audio", "format"]),
-        (["choices", 0, "message", "audio", "data"], ["choices", 0, "message", "audio", "format"]),
-        (["choices", 0, "audio", "data"], ["choices", 0, "audio", "format"]),
-        (["output", "audio", "data"], ["output", "audio", "format"]),
-    ]
-
-    for data_path, fmt_path in audio_path_pairs:
-        audio_b64 = pick_nested_value(data, data_path)
-        if isinstance(audio_b64, str) and audio_b64:
-            audio_format = pick_nested_value(data, fmt_path)
-            return audio_b64, audio_format if isinstance(audio_format, str) else None
-
-    if isinstance(data, dict):
-        audio = data.get("audio")
-        if isinstance(audio, dict):
-            audio_b64 = audio.get("data")
-            audio_format = audio.get("format")
-            if isinstance(audio_b64, str) and audio_b64:
-                return audio_b64, audio_format if isinstance(audio_format, str) else None
-        for value in data.values():
-            audio_b64, audio_format = extract_audio_payload(value)
-            if audio_b64:
-                return audio_b64, audio_format
-    elif isinstance(data, list):
-        for item in data:
-            audio_b64, audio_format = extract_audio_payload(item)
-            if audio_b64:
-                return audio_b64, audio_format
-
-    return None, None
-
-
 async def collect_response_body(current_req_id: str, current_queue: asyncio.Queue, timeout: int = 120) -> str:
     chunks: list[str] = []
     try:
@@ -456,6 +443,9 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
     body_text = json.dumps(mimo_payload, ensure_ascii=False)
     max_retries = len(state.active_clients)
     retry_state = RetryState()
+    route_key = "/v1/audio/speech"
+    request_started_at = time.monotonic()
+    record_request_started(route_key, is_streaming=False)
 
     for attempt in range(max_retries):
         req_id = "unknown"
@@ -473,22 +463,44 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
             req_id = prepared.req_id
             queue = prepared.queue
             first_msg = prepared.first_msg
+            first_byte_at = time.monotonic()
 
             raw_body = await collect_response_body(req_id, queue)
             status_code = first_msg.get("status", 200)
             if status_code >= 400:
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=status_code,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=False,
+                )
                 return Response(raw_body, status_code=status_code, media_type=content_type, headers=response_headers)
 
             try:
                 response_json = json.loads(raw_body)
             except json.JSONDecodeError:
                 logger.error(f"⚠️ TTS 上游响应不是合法 JSON [{req_id[:8]}]")
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=502,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=False,
+                )
                 return JSONResponse({"error": {"message": "上游 TTS 返回了非法 JSON"}}, status_code=502)
 
             audio_b64, actual_format = extract_audio_payload(response_json)
             if not audio_b64:
                 logger.error(f"⚠️ TTS 上游响应中未找到音频数据 [{req_id[:8]}]")
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=502,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=False,
+                )
                 return JSONResponse({"error": {"message": "上游 TTS 响应里没有音频数据"}}, status_code=502)
 
             try:
@@ -498,9 +510,23 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
                     audio_bytes = base64.b64decode(audio_b64)
                 except binascii.Error:
                     logger.error(f"⚠️ TTS 音频 Base64 解码失败 [{req_id[:8]}]")
+                    record_request_finished(
+                        route_key=route_key,
+                        status_code=502,
+                        started_at=request_started_at,
+                        first_byte_at=first_byte_at,
+                        success=False,
+                    )
                     return JSONResponse({"error": {"message": "上游 TTS 音频数据损坏"}}, status_code=502)
 
             final_format = (actual_format or response_format).lower()
+            record_request_finished(
+                route_key=route_key,
+                status_code=200,
+                started_at=request_started_at,
+                first_byte_at=first_byte_at,
+                success=True,
+            )
             return Response(audio_bytes, media_type=audio_media_type(final_format))
 
         except asyncio.TimeoutError:
@@ -515,6 +541,13 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
             retry_state.response_text = f"Gateway Error: {exc}"
             continue
 
+    record_request_finished(
+        route_key=route_key,
+        status_code=retry_state.status_code,
+        started_at=request_started_at,
+        first_byte_at=None,
+        success=False,
+    )
     return Response(retry_state.response_text, status_code=retry_state.status_code)
 
 @app.post("/v1/responses")
@@ -546,6 +579,9 @@ async def responses_handler(request: Request):
     chat_body_text = json.dumps(chat_req, ensure_ascii=False)
     max_retries = len(state.active_clients)
     retry_state = RetryState()
+    route_key = "/v1/responses"
+    request_started_at = time.monotonic()
+    record_request_started(route_key, is_streaming=is_streaming)
 
     for attempt in range(max_retries):
         req_id = "unknown"
@@ -564,10 +600,18 @@ async def responses_handler(request: Request):
             queue = prepared.queue
             first_msg = prepared.first_msg
             status_code = first_msg.get("status", 200)
+            first_byte_at = time.monotonic()
 
             if status_code >= 400:
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 raw_body = await collect_response_body(req_id, queue)
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=status_code,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=False,
+                )
                 return Response(raw_body, status_code=status_code, media_type=content_type, headers=response_headers)
 
             if is_streaming:
@@ -576,6 +620,7 @@ async def responses_handler(request: Request):
 
                 async def responses_stream_generator(current_req_id, current_queue):
                     last_data_time = time.monotonic()
+                    stream_succeeded = False
 
                     async def _do_keepalive():
                         await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
@@ -607,6 +652,7 @@ async def responses_handler(request: Request):
                             data_task = asyncio.ensure_future(current_queue.get())
                             msg = done.pop().result()
                             if msg.get("type") == "finish":
+                                stream_succeeded = True
                                 for evt in converter.finalize():
                                     yield evt.encode("utf-8")
                                 break
@@ -629,6 +675,16 @@ async def responses_handler(request: Request):
                         keepalive_task.cancel()
                         await asyncio.gather(data_task, keepalive_task, return_exceptions=True)
                         cleanup_pending_request(current_req_id)
+                        usage_obj = getattr(converter, "_usage", None)
+                        usage_data = usage_obj.model_dump() if usage_obj is not None else None
+                        record_request_finished(
+                            route_key=route_key,
+                            status_code=status_code if stream_succeeded else 502,
+                            started_at=request_started_at,
+                            first_byte_at=first_byte_at,
+                            success=stream_succeeded,
+                            usage=usage_data,
+                        )
 
                 logger.info(f"👈 建立 Responses 流式管道 [{req_id[:8]}]")
                 return StreamingResponse(
@@ -644,9 +700,24 @@ async def responses_handler(request: Request):
                     chat_resp = json.loads(raw_body)
                 except json.JSONDecodeError:
                     logger.error(f"⚠️ Responses 上游响应不是合法 JSON [{req_id[:8]}]")
+                    record_request_finished(
+                        route_key=route_key,
+                        status_code=502,
+                        started_at=request_started_at,
+                        first_byte_at=first_byte_at,
+                        success=False,
+                    )
                     return JSONResponse({"error": {"message": "上游返回了非法 JSON"}}, status_code=502)
 
                 responses_resp = responses_convert_response(chat_resp)
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=status_code,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=True,
+                    usage=chat_resp.get("usage"),
+                )
                 return JSONResponse(content=responses_resp)
 
         except asyncio.TimeoutError:
@@ -656,6 +727,13 @@ async def responses_handler(request: Request):
             cleanup_pending_request(req_id)
             continue
 
+    record_request_finished(
+        route_key=route_key,
+        status_code=retry_state.status_code,
+        started_at=request_started_at,
+        first_byte_at=None,
+        success=False,
+    )
     return Response(retry_state.response_text, status_code=retry_state.status_code)
 
 # (id, display_name, context_length, max_output)
@@ -715,12 +793,15 @@ async def _forward_request(request: Request, path: str):
 
     retry_state = RetryState()
     body_text = body.decode("utf-8", "ignore")
+    route_key = path
+    request_started_at = time.monotonic()
 
     is_streaming = False
     try:
         is_streaming = json.loads(body_text).get("stream", False) is True
     except (json.JSONDecodeError, AttributeError):
         pass
+    record_request_started(route_key, is_streaming=is_streaming)
 
     for attempt in range(max_retries):
         req_id = "unknown"
@@ -739,6 +820,7 @@ async def _forward_request(request: Request, path: str):
             queue = prepared.queue
             first_msg = prepared.first_msg
             status_code = first_msg.get("status", 200)
+            first_byte_at = time.monotonic()
 
             content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
 
@@ -747,6 +829,8 @@ async def _forward_request(request: Request, path: str):
                 last_data_time = time.monotonic()
                 data_task = asyncio.ensure_future(current_queue.get())
                 keepalive_task = None
+                stream_succeeded = False
+                usage_data = None
 
                 async def _do_keepalive():
                     await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
@@ -779,9 +863,13 @@ async def _forward_request(request: Request, path: str):
                         data_task = asyncio.ensure_future(current_queue.get())
                         msg = done.pop().result()
                         if msg.get("type") == "finish":
+                            stream_succeeded = True
                             break
                         elif msg.get("type") == "chunk":
-                            yield msg.get("body", "").encode("utf-8")
+                            chunk_body = msg.get("body", "")
+                            if usage_data is None:
+                                usage_data = extract_usage_from_sse_chunk(chunk_body)
+                            yield chunk_body.encode("utf-8")
                 except (asyncio.TimeoutError, TimeoutError):
                     logger.error(f"⚠️ 流式传输意外中断超时 [{current_req_id[:8]}]")
                 finally:
@@ -793,6 +881,15 @@ async def _forward_request(request: Request, path: str):
                         return_exceptions=True,
                     )
                     cleanup_pending_request(current_req_id)
+                    final_success = stream_succeeded and status_code < 400
+                    record_request_finished(
+                        route_key=route_key,
+                        status_code=status_code if stream_succeeded else 502,
+                        started_at=request_started_at,
+                        first_byte_at=first_byte_at,
+                        success=final_success,
+                        usage=usage_data,
+                    )
 
             logger.info(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
             return StreamingResponse(
@@ -810,6 +907,13 @@ async def _forward_request(request: Request, path: str):
             continue
 
     # 如果所有重试都失败，返回最后一次的状态
+    record_request_finished(
+        route_key=route_key,
+        status_code=retry_state.status_code,
+        started_at=request_started_at,
+        first_byte_at=None,
+        success=False,
+    )
     return Response(retry_state.response_text, status_code=retry_state.status_code)
 
 if __name__ == "__main__":
