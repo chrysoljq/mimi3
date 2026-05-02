@@ -299,7 +299,7 @@ async def dispatch_to_node(*, method: str, path: str, body: str, log_label: str,
 
     try:
         await target_ws.send_text(ws_payload)
-        logger.info(
+        logger.debug(
             f"👉 {log_label} [{req_id[:8]}] ({method} {path}) -> 节点: {node_label(target_ws)} "
             f"(尝试 {attempt_number})"
         )
@@ -560,13 +560,14 @@ async def responses_handler(request: Request):
     try:
         req_body = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(f"⚠️ Responses 请求体不是合法 JSON: {body[:500]}")
         return JSONResponse({"error": {"message": "请求体不是合法 JSON"}}, status_code=400)
 
     # 转换请求格式
     try:
         chat_req = responses_convert_request(req_body)
     except Exception as exc:
-        logger.error(f"⚠️ Responses 请求转换失败: {exc}")
+        logger.error(f"⚠️ Responses 请求转换失败: {exc}, 请求体: {body[:500]}")
         return JSONResponse({"error": {"message": f"请求格式转换失败: {exc}"}}, status_code=400)
 
     model = chat_req.get("model", "")
@@ -686,7 +687,8 @@ async def responses_handler(request: Request):
                             usage=usage_data,
                         )
 
-                logger.info(f"👈 建立 Responses 流式管道 [{req_id[:8]}]")
+                log_fn = logger.debug if status_code == 200 else logger.info
+                log_fn(f"👈 建立 Responses 流式管道 [{req_id[:8]}]")
                 return StreamingResponse(
                     responses_stream_generator(req_id, queue),
                     status_code=status_code,
@@ -891,7 +893,10 @@ async def _forward_request(request: Request, path: str):
                         usage=usage_data,
                     )
 
-            logger.info(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
+            log_fn = logger.debug if status_code == 200 else logger.info
+            log_fn(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
+            if status_code >= 400:
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}], 请求体: {body_text[:500]}")
             return StreamingResponse(
                 stream_generator(req_id, queue, use_keepalive=is_streaming),
                 status_code=status_code,
