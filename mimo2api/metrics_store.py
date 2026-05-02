@@ -463,7 +463,7 @@ def load_status_history(hours: int) -> dict[str, Any]:
 
     for row in rows:
         key = (row["component_type"], row["component_key"])
-        component = components[key]
+        component = components.setdefault(key, {"component_type": row["component_type"], "component_key": row["component_key"], "display_name": "Gateway" if row["component_type"] == "gateway" else row["component_key"], "points": [], "totals": {"requests_total": 0, "requests_succeeded": 0, "requests_failed": 0}})
         component["points"].append({
             "bucket_start": row["bucket_start"],
             "bucket_end": row["bucket_start"] + METRICS_BUCKET_SECONDS,
