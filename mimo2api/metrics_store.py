@@ -105,9 +105,15 @@ def record_usage(route_key: str, usage: dict[str, Any] | None) -> None:
     if not isinstance(usage, dict):
         return
 
-    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-    total_tokens = int(usage.get("total_tokens", 0) or 0)
+    prompt_tokens = int(
+        usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    )
+    completion_tokens = int(
+        usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    )
+    total_tokens = int(
+        usage.get("total_tokens", prompt_tokens + completion_tokens) or 0
+    )
 
     metrics = state.metrics["tokens"]
     route_tokens = _ensure_route_metrics(route_key)["tokens"]
