@@ -582,7 +582,7 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
                 _diag = diagnose_request(body_text)
                 _upstream = raw_body[:500] if raw_body else "(空响应体)"
                 logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   请求体: {body_text}\n   响应: {_upstream}")
-                record_error(route_key, status_code, f"上游返回 {status_code}", detail=raw_body[:500], request_body=body_text)
+                record_error(route_key, status_code, f"上游返回 {status_code}", model=json.loads(body_text).get("model","") if body_text else "", detail=raw_body[:500], request_body=body_text)
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 record_request_finished(
                     route_key=route_key,
@@ -726,7 +726,7 @@ async def responses_handler(request: Request):
                 _diag = diagnose_request(body_text)
                 _upstream = raw_body[:500] if raw_body else "(空响应体)"
                 logger.warning(f"⚠️ Responses 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   请求体: {body_text}\n   响应: {_upstream}")
-                record_error("/v1/responses", status_code, f"上游返回 {status_code}", detail=raw_body[:500], request_body=body_text)
+                record_error("/v1/responses", status_code, f"上游返回 {status_code}", model=json.loads(body_text).get("model","") if body_text else "", detail=raw_body[:500], request_body=body_text)
                 record_request_finished(
                     route_key=route_key,
                     status_code=status_code,
@@ -1022,7 +1022,7 @@ async def _forward_request(request: Request, path: str):
                 _upstream_err = first_msg.get("body", "")[:300]
                 _upstream = _upstream_err if _upstream_err else "(空响应体)"
                 logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   请求体: {body_text}\n   响应: {_upstream}")
-                record_error(route_key, status_code, f"上游返回 {status_code}", detail=_upstream_err, request_body=body_text)
+                record_error(route_key, status_code, f"上游返回 {status_code}", model=json.loads(body_text).get("model","") if body_text else "", detail=_upstream_err, request_body=body_text)
             return StreamingResponse(
                 stream_generator(req_id, queue, use_keepalive=is_streaming),
                 status_code=status_code,
