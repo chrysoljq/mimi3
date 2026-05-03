@@ -20,3 +20,4 @@ archive/http_captures/
 *.sh
 .ai_memory/
 .vscodestatus_page/
+status_page/
