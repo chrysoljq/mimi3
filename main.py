@@ -24,7 +24,28 @@ os.environ["MIMO2API_WS_URL"] = WS_TUNNEL_URL
 from mimo2api.web_service import app
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    import os
+    from logging.handlers import RotatingFileHandler
+
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "gateway.log")
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # journal（stdout）
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root_logger.addHandler(sh)
+
+    # 文件日志 — 10MB × 5 个轮转，不截断长行
+    fh = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+    fh.setFormatter(fmt)
+    root_logger.addHandler(fh)
+
     logging.info(f"🚀 mimo2api 统一主入口 - 正在启动网关并绑定集群到 {SERVER_HOST}:{SERVER_PORT}")
     logging.info(f"🔗 云端要求 Claw 主动连接的桥接 WS URL 将统一下发为: {WS_TUNNEL_URL}")
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, ws_max_size=10**8)
