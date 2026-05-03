@@ -262,9 +262,9 @@ def subtract_snapshot_component(current: dict[str, Any], previous: dict[str, Any
 def classify_component_status(total_requests: int, success_rate: float, avg_latency_ms: float) -> str:
     if total_requests <= 0:
         return "no_data"
-    if success_rate >= 99 and avg_latency_ms <= 3000:
+    if success_rate >= 95:
         return "operational"
-    if success_rate >= 95 and avg_latency_ms <= 8000:
+    if success_rate >= 85:
         return "degraded"
     return "major_outage"
 
