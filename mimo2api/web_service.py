@@ -536,6 +536,11 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
             raw_body = await collect_response_body(req_id, queue)
             status_code = first_msg.get("status", 200)
             if status_code >= 400:
+                try:
+                    _model = json.loads(body_text).get("model", "未指定")
+                except Exception:
+                    _model = "解析失败"
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] model={_model}, 响应: {raw_body[:300]}, 请求体: {body_text[:200]}")
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 record_request_finished(
                     route_key=route_key,
