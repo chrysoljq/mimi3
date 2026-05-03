@@ -13,6 +13,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 import os
+from pathlib import Path
+
+MODEL_MAPPING_FILE = Path(__file__).parent.parent / "model_mapping.json"
 
 # 引入 Manager 长驻协程任务
 from .manager import start_manager_tasks, trigger_rebuild
@@ -162,6 +165,71 @@ async def api_stats():
 async def api_status_history(hours: int = 24):
     hours = max(1, min(hours, 24 * METRICS_RETENTION_DAYS))
     return JSONResponse(content=await asyncio.to_thread(load_status_history, hours))
+
+
+# ── 模型映射 ──────────────────────────────────────────────────────
+
+def load_model_mapping() -> dict[str, str]:
+    """读取模型映射文件，返回 {源模型: 目标模型} 字典"""
+    if not MODEL_MAPPING_FILE.exists():
+        return {}
+    try:
+        return json.loads(MODEL_MAPPING_FILE.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_model_mapping(mapping: dict[str, str]) -> None:
+    """原子写入模型映射文件"""
+    tmp = MODEL_MAPPING_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), "utf-8")
+    tmp.rename(MODEL_MAPPING_FILE)
+
+
+def apply_model_mapping(body_text: str) -> str:
+    """如果请求体中有模型需要映射，替换后返回新 body；否则原样返回"""
+    mapping = load_model_mapping()
+    if not mapping:
+        return body_text
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, AttributeError):
+        return body_text
+    original_model = data.get("model")
+    if original_model and original_model in mapping:
+        data["model"] = mapping[original_model]
+        logger.info(f"🔀 模型映射: {original_model} → {data['model']}")
+        return json.dumps(data, ensure_ascii=False)
+    return body_text
+
+
+@app.get("/api/model_mapping")
+async def api_get_model_mapping():
+    return JSONResponse(content=load_model_mapping())
+
+
+@app.put("/api/model_mapping")
+async def api_put_model_mapping(request: Request):
+    body = await request.body()
+    try:
+        new_mapping = json.loads(body.decode("utf-8", "ignore").lstrip("\ufeff"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+    if not isinstance(new_mapping, dict):
+        return JSONResponse({"error": "映射必须是 JSON 对象"}, status_code=400)
+    save_model_mapping(new_mapping)
+    logger.info(f"📝 模型映射已更新: {new_mapping}")
+    return JSONResponse(content=new_mapping)
+
+
+@app.delete("/api/model_mapping/{model_name:path}")
+async def api_delete_model_mapping(model_name: str):
+    mapping = load_model_mapping()
+    if model_name in mapping:
+        del mapping[model_name]
+        save_model_mapping(mapping)
+        return JSONResponse({"ok": True, "deleted": model_name})
+    return JSONResponse({"error": f"模型 {model_name} 不在映射中"}, status_code=404)
 
 @app.websocket("/ws")
 async def ws_tunnel(ws: WebSocket):
@@ -558,7 +626,7 @@ async def responses_handler(request: Request):
 
     body = await request.body()
     try:
-        req_body = json.loads(body)
+        req_body = json.loads(body.decode("utf-8", "ignore").lstrip("\ufeff"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning(f"⚠️ Responses 请求体不是合法 JSON: {body[:500]}")
         return JSONResponse({"error": {"message": "请求体不是合法 JSON"}}, status_code=400)
@@ -794,7 +862,8 @@ async def _forward_request(request: Request, path: str):
         return Response("Gateway Error: 没有可用的内网节点", status_code=503)
 
     retry_state = RetryState()
-    body_text = body.decode("utf-8", "ignore")
+    body_text = body.decode("utf-8", "ignore").lstrip("\ufeff")
+    body_text = apply_model_mapping(body_text)
     route_key = path
     request_started_at = time.monotonic()
 
