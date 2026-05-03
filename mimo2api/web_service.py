@@ -540,7 +540,12 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
                     _model = json.loads(body_text).get("model", "未指定")
                 except Exception:
                     _model = "解析失败"
-                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] model={_model}, 响应: {raw_body[:300]}, 请求体: {body_text[:200]}")
+                try:
+                    _req = json.loads(body_text)
+                    _meta = f"model={_req.get('model')}, stream={_req.get('stream')}, msgs={len(_req.get('messages', []))}"
+                except Exception:
+                    _meta = "解析失败"
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_meta}, 响应: {raw_body[:500]}")
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 record_request_finished(
                     route_key=route_key,
@@ -975,7 +980,12 @@ async def _forward_request(request: Request, path: str):
                 except Exception:
                     _model = "解析失败"
                 _upstream_err = first_msg.get("body", "")[:300]
-                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] model={_model}, 响应: {_upstream_err}, 请求体: {body_text[:300]}")
+                try:
+                    _req = json.loads(body_text)
+                    _meta = f"model={_req.get('model')}, stream={_req.get('stream')}, msgs={len(_req.get('messages', []))}"
+                except Exception:
+                    _meta = "解析失败"
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_meta}, 响应: {_upstream_err}")
             return StreamingResponse(
                 stream_generator(req_id, queue, use_keepalive=is_streaming),
                 status_code=status_code,
