@@ -385,6 +385,28 @@ def write_history_rows(rows: list[tuple[Any, ...]]) -> None:
         conn.close()
 
 
+def reclassify_history() -> int:
+    """重新分类历史数据中的 status 字段（一次性迁移）"""
+    conn = sqlite3.connect(METRICS_DB_PATH, timeout=30)
+    try:
+        cur = conn.execute(
+            "UPDATE status_history SET status = CASE "
+            "WHEN requests_total <= 0 THEN 'no_data' "
+            "WHEN success_rate >= 95 THEN 'operational' "
+            "WHEN success_rate >= 85 THEN 'degraded' "
+            "ELSE 'major_outage' END "
+            "WHERE status != CASE "
+            "WHEN requests_total <= 0 THEN 'no_data' "
+            "WHEN success_rate >= 95 THEN 'operational' "
+            "WHEN success_rate >= 85 THEN 'degraded' "
+            "ELSE 'major_outage' END"
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 async def flush_history_bucket(bucket_start: int) -> None:
     current_snapshot = capture_metrics_snapshot()
     rows = build_history_rows(bucket_start, current_snapshot, state.metrics_history_last_snapshot)

@@ -40,6 +40,7 @@ from .metrics_store import (
     load_status_history,
     metrics_history_worker,
     node_label,
+    reclassify_history,
     record_attempt_finished,
     record_attempt_started,
     record_request_finished,
@@ -60,6 +61,9 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 正在拉起挂后台的 Claw 账号守护线程...")
     acquire_single_process_lock()
     await asyncio.to_thread(init_metrics_db)
+    fixed = await asyncio.to_thread(reclassify_history)
+    if fixed:
+        logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
     manager_bg_task = asyncio.create_task(start_manager_tasks())
     metrics_persist_task = asyncio.create_task(metrics_history_worker())
     yield
