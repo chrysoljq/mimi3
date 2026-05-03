@@ -10,7 +10,7 @@ from fastapi import WebSocket
 
 from .gateway_state import state
 
-METRICS_BUCKET_SECONDS = max(60, int(os.getenv("MIMO_METRICS_BUCKET_SECONDS", "300")))
+METRICS_BUCKET_SECONDS = max(60, int(os.getenv("MIMO_METRICS_BUCKET_SECONDS", "1800")))
 METRICS_RETENTION_DAYS = max(1, int(os.getenv("MIMO_METRICS_RETENTION_DAYS", "90")))
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 METRICS_DB_PATH = os.getenv("MIMO_METRICS_DB_PATH", os.path.join(ROOT_DIR, "gateway_metrics.db"))
