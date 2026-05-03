@@ -18,6 +18,7 @@ class GatewayState:
         self.metrics_started_at: float = time.time()
         self.metrics_history_last_snapshot: Dict[str, Any] | None = None
         self.metrics: Dict[str, Any] = self._default_metrics()
+        self.recent_errors: deque = deque(maxlen=200)
 
     @staticmethod
     def _default_metrics() -> Dict[str, Any]:

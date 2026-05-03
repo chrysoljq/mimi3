@@ -88,6 +88,47 @@ app.include_router(ui_router)
 
 RETRYABLE_STATUS_CODES = {401, 403, 429}
 NODE_RESPONSE_TIMEOUT = 30
+
+
+def diagnose_request(body_text: str) -> str:
+    """从请求体中提取关键诊断信息，用于 400 错误追踪"""
+    try:
+        req = json.loads(body_text)
+    except Exception:
+        return "body=非法JSON"
+    msgs = req.get("messages", [])
+    model = req.get("model", "未指定")
+    stream = req.get("stream", False)
+    # 估算 token（粗略：1 token ≈ 4 chars）
+    total_chars = sum(len(str(m.get("content", ""))) for m in msgs)
+    est_tokens = total_chars // 3  # 中文约 1 token/char，英文约 1/4，取中间值
+    # 最后一条消息预览
+    last = msgs[-1] if msgs else {}
+    last_role = last.get("role", "?")
+    last_content = str(last.get("content", ""))[:150]
+    # 系统消息预览
+    sys_msgs = [m for m in msgs if m.get("role") == "system"]
+    sys_preview = str(sys_msgs[0].get("content", ""))[:100] if sys_msgs else "无"
+    # tools 信息
+    tools = req.get("tools", [])
+    tool_count = len(tools)
+    return (
+        f"model={model}, stream={stream}, msgs={len(msgs)}, "
+        f"est_tokens≈{est_tokens}, chars={total_chars}, tools={tool_count}, "
+        f"sys={sys_preview}, last=[{last_role}]{last_content}"
+    )
+
+
+def record_error(route: str, status_code: int, reason: str, model: str = "", detail: str = ""):
+    """记录错误到环形缓冲区，可通过 /api/errors 查询"""
+    state.recent_errors.append({
+        "ts": int(time.time()),
+        "route": route,
+        "status": status_code,
+        "reason": reason[:200],
+        "model": model,
+        "detail": detail[:500],
+    })
 STREAM_CHUNK_TIMEOUT = 60
 STREAM_KEEPALIVE_INTERVAL = 25  # 秒，需小于 Cloudflare 超时 (~100s)
 QUEUE_DRAIN_TIMEOUT = 5
@@ -169,6 +210,14 @@ async def api_stats():
 async def api_status_history(hours: int = 24):
     hours = max(1, min(hours, 24 * METRICS_RETENTION_DAYS))
     return JSONResponse(content=await asyncio.to_thread(load_status_history, hours))
+
+
+@app.get("/api/errors")
+async def api_errors(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    errors = list(state.recent_errors)[-limit:]
+    errors.reverse()  # 最新的在前
+    return JSONResponse(content={"count": len(errors), "errors": errors})
 
 
 # ── 模型映射 ──────────────────────────────────────────────────────
@@ -540,16 +589,10 @@ async def audio_speech_handler(payload: AudioSpeechRequest):
             raw_body = await collect_response_body(req_id, queue)
             status_code = first_msg.get("status", 200)
             if status_code >= 400:
-                try:
-                    _model = json.loads(body_text).get("model", "未指定")
-                except Exception:
-                    _model = "解析失败"
-                try:
-                    _req = json.loads(body_text)
-                    _meta = f"model={_req.get('model')}, stream={_req.get('stream')}, msgs={len(_req.get('messages', []))}"
-                except Exception:
-                    _meta = "解析失败"
-                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_meta}, 响应: {raw_body[:500]}")
+                _diag = diagnose_request(body_text)
+                _upstream = raw_body[:500] if raw_body else "(空响应体)"
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   响应: {_upstream}")
+                record_error(route_key, status_code, f"上游返回 {status_code}", model=_diag.split(",")[0].split("=")[1], detail=raw_body[:500])
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 record_request_finished(
                     route_key=route_key,
@@ -643,6 +686,7 @@ async def responses_handler(request: Request):
         req_body = json.loads(body.decode("utf-8", "ignore").lstrip("\ufeff"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning(f"⚠️ Responses 请求体不是合法 JSON: {body[:500]}")
+        record_error("/v1/responses", 400, "请求体不是合法 JSON", detail=body[:300].decode("utf-8", "ignore"))
         return JSONResponse({"error": {"message": "请求体不是合法 JSON"}}, status_code=400)
 
     # 转换请求格式
@@ -650,6 +694,7 @@ async def responses_handler(request: Request):
         chat_req = responses_convert_request(req_body)
     except Exception as exc:
         logger.error(f"⚠️ Responses 请求转换失败: {exc}, 请求体: {body[:500]}")
+        record_error("/v1/responses", 400, f"请求格式转换失败: {exc}", detail=body[:300].decode("utf-8", "ignore"))
         return JSONResponse({"error": {"message": f"请求格式转换失败: {exc}"}}, status_code=400)
 
     model = chat_req.get("model", "")
@@ -688,6 +733,10 @@ async def responses_handler(request: Request):
             if status_code >= 400:
                 content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
                 raw_body = await collect_response_body(req_id, queue)
+                _diag = diagnose_request(body_text)
+                _upstream = raw_body[:500] if raw_body else "(空响应体)"
+                logger.warning(f"⚠️ Responses 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   响应: {_upstream}")
+                record_error("/v1/responses", status_code, f"上游返回 {status_code}", detail=raw_body[:500])
                 record_request_finished(
                     route_key=route_key,
                     status_code=status_code,
@@ -979,17 +1028,11 @@ async def _forward_request(request: Request, path: str):
             log_fn = logger.debug if status_code == 200 else logger.info
             log_fn(f"👈 建立流式响应管道 [{req_id[:8]}] - 状态码: {status_code}")
             if status_code >= 400:
-                try:
-                    _model = json.loads(body_text).get("model", "未指定")
-                except Exception:
-                    _model = "解析失败"
+                _diag = diagnose_request(body_text)
                 _upstream_err = first_msg.get("body", "")[:300]
-                try:
-                    _req = json.loads(body_text)
-                    _meta = f"model={_req.get('model')}, stream={_req.get('stream')}, msgs={len(_req.get('messages', []))}"
-                except Exception:
-                    _meta = "解析失败"
-                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_meta}, 响应: {_upstream_err}")
+                _upstream = _upstream_err if _upstream_err else "(空响应体)"
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] {_diag}\n   响应: {_upstream}")
+                record_error(route_key, status_code, f"上游返回 {status_code}", model=_diag.split(",")[0].split("=")[1], detail=_upstream_err)
             return StreamingResponse(
                 stream_generator(req_id, queue, use_keepalive=is_streaming),
                 status_code=status_code,
