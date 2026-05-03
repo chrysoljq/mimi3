@@ -974,7 +974,8 @@ async def _forward_request(request: Request, path: str):
                     _model = json.loads(body_text).get("model", "未指定")
                 except Exception:
                     _model = "解析失败"
-                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] model={_model}, 请求体: {body_text[:500]}")
+                _upstream_err = first_msg.get("body", "")[:300]
+                logger.warning(f"⚠️ 上游返回 {status_code} [{req_id[:8]}] model={_model}, 响应: {_upstream_err}, 请求体: {body_text[:300]}")
             return StreamingResponse(
                 stream_generator(req_id, queue, use_keepalive=is_streaming),
                 status_code=status_code,
